@@ -516,10 +516,37 @@ async function loadSettings() {
   } catch {
     saved = null;
   }
-  if (saved && typeof saved === "object") {
-    settings = { ...structuredClone(DEFAULTS), ...saved, tune: { ...defaultTune(), ...(saved.tune || {}) } };
+  settings = sanitizeSettings(saved);
+}
+
+// Stored settings can come from older versions, another device or a corrupted
+// sync entry, so every field is type-checked and clamped before use.
+function sanitizeSettings(raw) {
+  const s = structuredClone(DEFAULTS);
+  if (!raw || typeof raw !== "object") return s;
+  const ranges = Object.fromEntries(CONTROLS.filter((c) => c.type === "range").map((c) => [c.key, c]));
+  const num = (v, c, fallback) => (typeof v === "number" && Number.isFinite(v) ? clamp(v, c.min, c.max) : fallback);
+
+  for (const key of Object.keys(DEFAULTS)) {
+    if (key === "tune" || !(key in raw)) continue;
+    const v = raw[key];
+    const def = DEFAULTS[key];
+    if (typeof def === "boolean") s[key] = typeof v === "boolean" ? v : def;
+    else if (typeof def === "number") s[key] = ranges[key] ? num(v, ranges[key], def) : typeof v === "number" && Number.isFinite(v) ? v : def;
+    else if (typeof def === "string") s[key] = typeof v === "string" ? v : def;
   }
-  if (!ANIMAL_BY_ID[settings.animal]) settings.animal = DEFAULTS.animal;
+  s.name = s.name.slice(0, 40);
+  if (!ANIMAL_BY_ID[s.animal]) s.animal = DEFAULTS.animal;
+
+  const tune = raw.tune && typeof raw.tune === "object" ? raw.tune : {};
+  for (const A of ANIMALS) {
+    const t = tune[A.id] && typeof tune[A.id] === "object" ? tune[A.id] : {};
+    s.tune[A.id] = {
+      direction: num(t.direction, ranges.direction, A.direction),
+      spread: num(t.spread, ranges.spread, A.spread),
+    };
+  }
+  return s;
 }
 
 let saveTimer = 0;
@@ -1130,13 +1157,25 @@ function drawRipples(half) {
   }
 }
 
+// Large or high-DPI screens can make a full frame expensive. When the average
+// frame cost gets close to the 60 fps budget, drop to ~30 fps; go back up
+// once it is comfortably cheap again.
 let last = 0;
+let frameCost = 0;
+let throttled = false;
 function frame(now) {
+  requestAnimationFrame(frame);
+  // a zero-sized window (still loading, minimised) has nothing to draw into
+  if (!R.W || !R.H) return;
+  if (throttled && last && now - last < 31) return;
   const dt = last ? clamp((now - last) / 1000, 0, 0.05) : 0.016;
   last = now;
+  const t0 = performance.now();
   step(dt);
   render(dt);
-  requestAnimationFrame(frame);
+  frameCost = lerp(frameCost, performance.now() - t0, 0.05);
+  if (!throttled && frameCost > 11) throttled = true;
+  else if (throttled && frameCost < 6) throttled = false;
 }
 
 /* =========================================================================
@@ -1166,8 +1205,20 @@ function looksLikeUrl(text) {
   if (/\s/.test(text)) return false;
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) return true;
   if (/^(localhost|\d{1,3}(\.\d{1,3}){3})(:\d+)?(\/.*)?$/i.test(text)) return true;
-  return /^[^\s/]+\.[a-z]{2,}(:\d+)?(\/.*)?$/i.test(text);
+  const m = /^[^\s/:]+\.([a-z]{2,})(:\d+)?(\/.*)?$/i.exec(text);
+  if (!m) return false;
+  // "node.js" or "config.json" alone is more likely a search than a site;
+  // with a port, a path or "www." it is treated as an address again.
+  if (m[2] || m[3] || /^www\./i.test(text)) return true;
+  return !FILE_LIKE_TLDS.has(m[1].toLowerCase());
 }
+
+const FILE_LIKE_TLDS = new Set([
+  "js", "mjs", "cjs", "ts", "tsx", "jsx", "json", "md", "txt", "py", "rb", "php", "java", "kt", "swift",
+  "c", "h", "cpp", "hpp", "cs", "rs", "html", "htm", "css", "scss", "xml", "yml", "yaml", "toml", "ini",
+  "cfg", "lock", "log", "csv", "sql", "sh", "bat", "exe", "dmg", "pdf", "doc", "docx", "xls", "xlsx",
+  "ppt", "pptx", "png", "jpg", "jpeg", "gif", "svg", "webp", "mp3", "mp4", "mov", "wav", "zip", "tar", "gz",
+]);
 
 function setupComposer() {
   const form = $("composer");
@@ -1216,7 +1267,7 @@ function shortTitle(site) {
 function renderShortcuts() {
   const nav = $("shortcuts");
   nav.hidden = !settings.shortcuts;
-  if (!settings.shortcuts || nav.childElementCount) return;
+  if (!settings.shortcuts) return;
   if (typeof chrome === "undefined" || !chrome.topSites) return;
   chrome.topSites.get((sites) => {
     nav.replaceChildren();
@@ -1527,8 +1578,19 @@ async function boot() {
   setupComposer();
   renderShortcuts();
   updateClock();
-  setInterval(updateClock, 1000);
+  let clockTimer = setInterval(updateClock, 1000);
   showHint();
+
+  // pause the clock while the tab is hidden; refresh it and the top sites on return
+  document.addEventListener("visibilitychange", () => {
+    clearInterval(clockTimer);
+    clockTimer = 0;
+    if (document.hidden) return;
+    updateClock();
+    clockTimer = setInterval(updateClock, 1000);
+    renderShortcuts();
+    last = 0;
+  });
 
   window.addEventListener("resize", () => {
     resize();
@@ -1573,7 +1635,7 @@ async function boot() {
       if (!next || JSON.stringify(next) === JSON.stringify(settings)) return;
       const prevAnimal = settings.animal;
       const prevCell = settings.cell;
-      settings = { ...structuredClone(DEFAULTS), ...next, tune: { ...defaultTune(), ...(next.tune || {}) } };
+      settings = sanitizeSettings(next);
       if (settings.cell !== prevCell) resize();
       if (!settings.random && settings.animal !== prevAnimal) showAnimal(settings.animal);
       syncPopulation();
